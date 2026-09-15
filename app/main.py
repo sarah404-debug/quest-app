@@ -14,7 +14,6 @@ QUESTS = [
 ]
 
 # This is our "memory" of quests that have been handed out.
-# Key = instance_id, Value = details about that specific quest attempt.
 quest_instances = {}
 
 @app.get("/")
@@ -24,7 +23,7 @@ def read_root():
 @app.get("/quest/new")
 def get_new_quest():
     quest = random.choice(QUESTS)
-    instance_id = str(uuid.uuid4())  # a unique ID for this specific quest attempt
+    instance_id = str(uuid.uuid4())
 
     quest_instances[instance_id] = {
         "instance_id": instance_id,
@@ -37,13 +36,30 @@ def get_new_quest():
 
     return quest_instances[instance_id]
 
-@app.post("/quest/{instance_id}/complete")
-def complete_quest(instance_id: str):
+def _resolve_quest(instance_id: str, new_status: str):
+    """Shared helper: mark a quest instance with a given final status."""
     if instance_id not in quest_instances:
         raise HTTPException(status_code=404, detail="Quest instance not found")
 
-    quest_instances[instance_id]["status"] = "completed"
-    return quest_instances[instance_id]
+    instance = quest_instances[instance_id]
+
+    if instance["status"] != "in_progress":
+        raise HTTPException(status_code=400, detail=f"Quest is already '{instance['status']}'")
+
+    instance["status"] = new_status
+    return instance
+
+@app.post("/quest/{instance_id}/complete")
+def complete_quest(instance_id: str):
+    return _resolve_quest(instance_id, "completed")
+
+@app.post("/quest/{instance_id}/skip")
+def skip_quest(instance_id: str):
+    return _resolve_quest(instance_id, "skipped")
+
+@app.post("/quest/{instance_id}/abandon")
+def abandon_quest(instance_id: str):
+    return _resolve_quest(instance_id, "abandoned")
 
 @app.get("/quest/status")
 def quest_status():
