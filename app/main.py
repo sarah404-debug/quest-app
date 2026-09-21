@@ -1,10 +1,50 @@
+import contextvars
+import json
+import logging
 import random
+import sys
 import time
 import uuid
-from fastapi import FastAPI, HTTPException, Response
-from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from datetime import datetime, timezone
+from fastapi import FastAPI, HTTPException, Request, Response
+from prometheus_client import Counter, Gauge, Histogram, Summary, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI()
+
+# ── Logging ─────────────────────────────────────────────────
+# Every log line is one JSON object written to stdout (Docker captures stdout).
+# request_id lives in a context variable so any log line written while handling
+# a request automatically carries that request's ID.
+request_id_var = contextvars.ContextVar("request_id", default="-")
+
+# Extra fields we allow on a log line (passed via logger.info(..., extra={...})).
+LOG_FIELDS = (
+    "event", "method", "path", "endpoint", "status", "duration_ms",
+    "instance_id", "category", "difficulty", "quest_status",
+)
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        entry = {
+            "time": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "service": "quest-app",
+            "severity": record.levelname,
+            "message": record.getMessage(),
+            "request_id": request_id_var.get(),
+        }
+        for field in LOG_FIELDS:
+            if hasattr(record, field):
+                entry[field] = getattr(record, field)
+        if record.exc_info:
+            entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(entry)
+
+logger = logging.getLogger("quest-app")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(JsonFormatter())
+logger.addHandler(_handler)
 
 # ── Quest pool ──────────────────────────────────────────────
 QUESTS = [
@@ -51,10 +91,89 @@ quests_in_progress = Gauge(
 )
 
 # HISTOGRAM: measures how long something takes, sorted into buckets.
+# Custom buckets: quest generation takes microseconds, so the buckets start very small.
+# The larger buckets (0.1, 0.5, 1) leave room to see a slow request later.
 quest_generation_latency_seconds = Histogram(
     "quest_generation_latency_seconds",
-    "Time taken to generate a new quest"
+    "Time taken to generate a new quest",
+    buckets=[0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1]
 )
+
+# SUMMARY: tracks a running count and sum of observations (so we can compute an average).
+# Here: how many seconds pass between a quest being generated and being resolved.
+quest_time_to_resolve_seconds = Summary(
+    "quest_time_to_resolve_seconds",
+    "Seconds between a quest being generated and being resolved",
+    ["status"]
+)
+
+# APPLICATION METRICS: every HTTP request, recorded by the middleware below.
+# COUNTER: how many requests, split by method, endpoint and status code (so failures are visible).
+http_requests_total = Counter(
+    "http_requests_total",
+    "Total HTTP requests handled by the app",
+    ["method", "endpoint", "status"]
+)
+
+# HISTOGRAM: how long each request takes end to end.
+http_request_duration_seconds = Histogram(
+    "http_request_duration_seconds",
+    "Time taken to handle an HTTP request",
+    ["method", "endpoint"],
+    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5]
+)
+
+# ── Middleware ──────────────────────────────────────────────
+@app.middleware("http")
+async def track_requests(request: Request, call_next):
+    # Don't count or log Prometheus scraping /metrics itself.
+    if request.url.path == "/metrics":
+        return await call_next(request)
+
+    # Give every request its own ID; all log lines for this request will carry it.
+    request_id = uuid.uuid4().hex[:12]
+    request_id_var.set(request_id)
+
+    start = time.time()
+    status_code = 500  # assume failure unless the request finishes normally
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.exception("unhandled exception", extra={"event": "unhandled_exception"})
+        raise
+    finally:
+        # Use the route template (e.g. /quest/{instance_id}/complete), NOT the real URL,
+        # so we don't create a new time series for every instance_id.
+        route = request.scope.get("route")
+        endpoint = route.path if route else "unmatched"
+        duration = time.time() - start
+
+        http_requests_total.labels(
+            method=request.method, endpoint=endpoint, status=str(status_code)
+        ).inc()
+        http_request_duration_seconds.labels(
+            method=request.method, endpoint=endpoint
+        ).observe(duration)
+
+        # INFO for success, WARNING for client errors (4xx), ERROR for server errors (5xx).
+        if status_code >= 500:
+            level = logging.ERROR
+        elif status_code >= 400:
+            level = logging.WARNING
+        else:
+            level = logging.INFO
+        logger.log(level, "request completed", extra={
+            "event": "request_completed",
+            "method": request.method,
+            "path": request.url.path[:100],
+            "endpoint": endpoint,
+            "status": status_code,
+            "duration_ms": round(duration * 1000, 2),
+        })
 
 # ── Endpoints ───────────────────────────────────────────────
 @app.get("/")
@@ -79,6 +198,7 @@ def get_new_quest():
         "difficulty": quest["difficulty"],
         "text": quest["text"],
         "status": "in_progress",
+        "created_at": time.time(),  # remembered so we can measure time-to-resolve later
     }
 
     # Update metrics
@@ -88,20 +208,41 @@ def get_new_quest():
     duration = time.time() - start_time
     quest_generation_latency_seconds.observe(duration)
 
+    logger.info("quest generated", extra={
+        "event": "quest_generated",
+        "instance_id": instance_id,
+        "category": quest["category"],
+        "difficulty": quest["difficulty"],
+    })
+
     return quest_instances[instance_id]
 
 def _resolve_quest(instance_id: str, new_status: str):
     if instance_id not in quest_instances:
+        logger.warning("quest not found", extra={
+            "event": "quest_not_found",
+            "instance_id": instance_id[:64],  # cap length: this value comes from the URL
+        })
         raise HTTPException(status_code=404, detail="Quest instance not found")
 
     instance = quest_instances[instance_id]
 
     if instance["status"] != "in_progress":
+        logger.warning("quest already resolved", extra={
+            "event": "quest_already_resolved",
+            "instance_id": instance_id,
+            "quest_status": instance["status"],
+        })
         raise HTTPException(status_code=400, detail=f"Quest is already '{instance['status']}'")
 
     instance["status"] = new_status
     category = instance["category"]
     difficulty = instance["difficulty"]
+
+    # Record how long this quest took to resolve (Summary).
+    quest_time_to_resolve_seconds.labels(status=new_status).observe(
+        time.time() - instance["created_at"]
+    )
 
     # This quest is no longer "in progress", so the gauge goes DOWN.
     quests_in_progress.labels(category=category).dec()
@@ -113,6 +254,14 @@ def _resolve_quest(instance_id: str, new_status: str):
         quests_skipped_total.labels(category=category).inc()
     elif new_status == "abandoned":
         quests_abandoned_total.labels(category=category).inc()
+
+    logger.info("quest resolved", extra={
+        "event": "quest_resolved",
+        "instance_id": instance_id,
+        "category": category,
+        "difficulty": difficulty,
+        "quest_status": new_status,
+    })
 
     return instance
 
