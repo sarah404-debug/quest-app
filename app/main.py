@@ -7,10 +7,15 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, Gauge, Histogram, Summary, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI()
+
+# Serve the small one-page UI (app/static/index.html) at /ui.
+app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
 
 # ── Logging ─────────────────────────────────────────────────
 # Every log line is one JSON object written to stdout (Docker captures stdout).
