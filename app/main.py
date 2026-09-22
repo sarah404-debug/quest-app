@@ -1,6 +1,7 @@
 import contextvars
 import json
 import logging
+import os
 import random
 import sys
 import time
@@ -45,6 +46,15 @@ logger.propagate = False
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(JsonFormatter())
 logger.addHandler(_handler)
+
+# ── Fault injection switch (Part E1) ───────────────────────
+# Off by default. To turn on, set these two environment variables (see
+# docker-compose.yml / .env). FAULT_EVERY_N=0 means "never trigger".
+# Every Nth call to GET /quest/new sleeps for FAULT_DELAY_MS milliseconds,
+# simulating a slow dependency. This is easy to switch off again afterwards.
+FAULT_DELAY_MS = int(os.environ.get("FAULT_DELAY_MS", "0"))
+FAULT_EVERY_N = int(os.environ.get("FAULT_EVERY_N", "0"))
+_fault_request_count = 0  # counts calls to /quest/new, to know when "every Nth" is due
 
 # ── Quest pool ──────────────────────────────────────────────
 QUESTS = [
@@ -186,6 +196,18 @@ def metrics():
 
 @app.get("/quest/new")
 def get_new_quest():
+    global _fault_request_count
+
+    # Fault injection (Part E1): if enabled, delay every Nth call to this
+    # endpoint. Placed before start_time so it inflates the overall HTTP
+    # response time (seen by the middleware and Grafana), while the
+    # quest_generation_latency_seconds histogram below still measures only
+    # the app's own work, unaffected by the injected delay.
+    if FAULT_EVERY_N > 0:
+        _fault_request_count += 1
+        if _fault_request_count % FAULT_EVERY_N == 0:
+            time.sleep(FAULT_DELAY_MS / 1000)
+
     start_time = time.time()  # mark when we started, so we can measure duration
 
     quest = random.choice(QUESTS)
